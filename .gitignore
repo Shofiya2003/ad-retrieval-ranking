@@ -1,0 +1,12 @@
+# Generated + processed data (regenerate with scripts/generate_raw_ads.py)
+data/raw/*
+data/clean/*
+!data/raw/.gitkeep
+!data/clean/.gitkeep
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
