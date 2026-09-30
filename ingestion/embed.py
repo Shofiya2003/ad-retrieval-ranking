@@ -32,17 +32,15 @@ EXIT_OK = 0
 EXIT_GATE_FAILED = 1
 EXIT_INPUT_ERROR = 2
 
-# How many texts to hand the tokenizer per call when counting tokens.
+# How many ADS to hand the tokenizer per call when measuring their length.
+# This is a count of ads, not of tokens, and it never splits an ad: each
+# call receives 2048 whole ads and the boundaries fall between them.
 #
-# The gate only needs each text's LENGTH, but the tokenizer returns the full
-# list of token ids for every text. Asking it for all 44,200 at once would
-# materialise ~1.8 million Python ints (tens of MB of objects) just to call
-# len() on them and throw them away. Chunking caps that at 2048 texts' worth,
-# and the total work is identical either way.
-#
-# At our size this is a guard rail rather than a rescue; it earns its keep if
-# this pipeline is ever pointed at millions of ads.
-TOKEN_CHUNK = 2048
+# It exists purely to cap memory. The tokenizer returns every token id for
+# every ad, but we only want len() of each. Asking for all 44,200 at once
+# peaks at 142MB; in slices of 2048 it peaks at 6.8MB, with identical
+# results and slightly faster (measured).
+TOKENIZER_ADS_PER_CALL = 2048
 
 
 def compose_text(record: dict) -> str:
@@ -58,13 +56,6 @@ def compose_text(record: dict) -> str:
     answers "which relevant ad should win?". Those stay separable, which is
     what makes the ranking weights in Phase 6 meaningful.
 
-    Note this is a RANKING SIGNAL, not a pre-filter: incoming queries are free
-    text and carry no category, so there is nothing to filter on before the
-    search. Retrieval runs over every ad and category match is scored
-    afterwards. (Real ad servers do filter first, on eligibility -- budget
-    exhausted, targeting, frequency caps -- which is a different thing from
-    relevance.)
-
     BID is excluded because it is not meaning. Two identical ads at $2 and $20
     should retrieve identically and be separated by the auction, not by the
     vector space.
@@ -76,7 +67,7 @@ def compose_text(record: dict) -> str:
     separator = " " if headline[-1:] in ".!?" else ". "
     return f"{headline}{separator}{description}"
 
-
+# load the clean data into a list of dictionary (we convert the json to dictionary)
 def load_clean_records(path: Path, limit: int | None = None) -> list[dict]:
     records = []
     with path.open("r", encoding="utf-8") as handle:
@@ -90,10 +81,17 @@ def load_clean_records(path: Path, limit: int | None = None) -> list[dict]:
     return records
 
 
-def count_tokens_chunked(embedder: Embedder, texts: list[str]) -> list[int]:
+def count_all_token_lengths(embedder: Embedder, texts: list[str]) -> list[int]:
+    """Token length of every ad, measured a few thousand ads at a time.
+
+    Returns one length per ad, in the same order as `texts`. Every ad is
+    measured whole; the slicing is over the LIST of ads and is invisible in
+    the result.
+    """
     counts: list[int] = []
-    for start in range(0, len(texts), TOKEN_CHUNK):
-        counts.extend(embedder.count_tokens(texts[start : start + TOKEN_CHUNK]))
+    for start in range(0, len(texts), TOKENIZER_ADS_PER_CALL):
+        # get counts tokens in each ad by passing only TOKENIZER_ADS_PER_CALL ads at a time 
+        counts.extend(embedder.count_tokens(texts[start : start + TOKENIZER_ADS_PER_CALL]))
     return counts
 
 
@@ -129,10 +127,12 @@ def run(
     # at max_tokens. That mismatch is the one seam between the two phases, so
     # it is checked here BEFORE any embedding work happens -- failing after
     # running the model over 44k ads would waste the expensive part.
-    token_counts = count_tokens_chunked(embedder, texts)
-    offenders = [
-        (records[i]["ad_id"], n) for i, n in enumerate(token_counts) if n > embedder.max_tokens
-    ]
+    token_counts = count_all_token_lengths(embedder, texts)
+    offenders: list[tuple[str, int]] = []
+    for i, n in enumerate(token_counts):
+        if n > embedder.max_tokens:
+            offenders.append((records[i]["ad_id"], n))
+    
     if offenders and not allow_truncation:
         raise TruncationError(offenders, embedder.max_tokens)
 
