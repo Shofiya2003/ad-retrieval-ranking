@@ -4,7 +4,7 @@ A small but realistic ad-serving system: a Python ingestion pipeline that valida
 publishes ad data, feeding a Go serving layer that does vector retrieval and ranking under a
 latency SLA, with Redis as both feature store and cache.
 
-**Status: Phase 1 complete** (validate + clean). Phases 2–10 to follow.
+**Status: Phases 1–2 complete** (validate → clean → embed → publish). Phases 3–10 to follow.
 
 ## Architecture (target)
 
@@ -80,25 +80,128 @@ Everything streams — one line in, one line out, constant memory. The one excep
 detection, which is inherently stateful: two sets over 50k records is nothing, but at 100M you'd
 reach for a Bloom filter (accepting a small false-positive rate) or an external sort on the key.
 
+## Phase 2 — Embed + Publish
+
+Turns each clean ad into a 384-number vector (an embedding) and packages those vectors into a
+versioned bundle the Go service can load with only its standard library.
+
+An embedding places text in space so that text meaning similar things lands nearby. That's what
+lets retrieval work without shared keywords: *"how do I lower my tax bill"* returns tax-filing
+ads that barely share a word with the query.
+
+### Model
+
+`sentence-transformers/all-MiniLM-L6-v2`, pinned to revision `1110a243fdf4`. 384 dimensions,
+256-token limit, Apache-2.0. Chosen for speed (the Phase 4 sidecar embeds a query on every
+request), small vectors (half the distance cost of a 768-dim model), and because queries and ads
+are embedded identically — `bge`/`e5` need different prefixes for each, and getting that wrong in
+the sidecar degrades quality with no error.
+
+### Why ads are embedded offline but queries at request time
+
+Embedding 44k ads takes ~25 seconds and nobody is waiting on it. The serving path embeds only the
+single short query per request. Embedding candidate ads at request time would make latency scale
+with the candidate set.
+
+### What goes into the vector
+
+`"{headline}. {description}"` — **category and bid are deliberately excluded.** Phase 6 scores
+category match and bid as separate, explicit ranking signals; folding category into the vector
+would count it twice and blur retrieval ("what is this ad about?") against ranking ("which
+relevant ad should win?"). A bid isn't meaning at all.
+
+### Vectors are unit length, so similarity is a dot product
+
+Every vector is L2-normalised to length 1.0. For unit vectors, cosine similarity **equals** the
+dot product — so Phase 4 needs no square roots in the hot path. `publish.py` refuses to publish
+if any vector's length drifts from 1.0.
+
+### Four ways this stage refuses to fail silently
+
+| Guard | The quiet disaster it prevents |
+|---|---|
+| **Token gate** | Phase 1 limits *characters*; the model truncates by *tokens* at 256. `embed.py` counts tokens with the model's own tokenizer **before** embedding, and fails listing the offending `ad_id`s. Without it, over-long ads are cut short and nothing reports it. |
+| **Staleness guard** | `publish.py` re-hashes `ads_clean.jsonl` and refuses if it changed since embedding. Otherwise re-running `validate.py` and publishing stale vectors pairs every vector with a *different* ad — nothing crashes, search just returns confident nonsense. |
+| **Integrity checks** | NaN rows (a NaN compares false against everything, so the ad becomes invisible to search) and all-zero rows (dot product 0 against every query, can never be retrieved). |
+| **Model identity in the manifest** | The Phase 4 sidecar reads the model name and revision *from the manifest* instead of hard-coding them, so query and ad vectors cannot come from different models. A mismatch produces plausible-looking similarity scores that mean nothing. |
+
+### The published bundle
+
+```
+data/published/
+  LATEST                          -> text file naming the current version
+  20260922T201033Z-4c4c2646/
+    vectors.f32     raw little-endian float32, 44,200 x 384, row-major (67,891,200 bytes)
+    ads.jsonl       one ad per line with an explicit `row` field; line i ↔ vector row i
+    manifest.json   counts, dims, checksums, model identity, source provenance
+```
+
+Raw float32 rather than JSON because Go reads it with `encoding/binary` in one pass instead of
+parsing 17 million float strings at startup. Rather than `.npy` because that needs a third-party
+Go parser; the manifest carries the same information as plain JSON. Rather than Redis because
+that's Phase 5 — flat files keep Go startup deterministic and debuggable.
+
+**Publishing is atomic.** The bundle is written to a staging directory, `fsync`ed, then renamed
+into place; `LATEST` is updated last, also atomically. A reader following `LATEST` sees either
+the complete old bundle or the complete new one, never a mixture — and a crash part-way through
+leaves the previous version serving untouched. This is also the hook Phase 9 needs for hot reload.
+
+### Why `embed` and `publish` are separate stages
+
+Embedding is expensive (runs a model); publishing is cheap (moves bytes). Splitting them means
+the output format can change, or a bundle be rebuilt, without paying for the model again.
+
+## Results — Phase 2 (44,200 ads, Apple M4)
+
+```
+embed     24.66s   1,792 ads/sec on the M4 GPU (mps), batch size 256
+tokens    p50=37  p99=46  max=55   limit=256   truncated=0
+publish   67,891,200 bytes = 44,200 x 384 x 4, checksum verified
+probe     category precision@5 = 40/40 = 100%
+```
+
+Memory math worth knowing: 68 MB for 44k ads → roughly **15 GB at 10M ads**, which is why
+production systems quantize (int8 / product quantization) at that scale.
+
+**One honest finding.** For *"warm waterproof jacket for winter"* the top hit is a denim jacket,
+ahead of the rain shells and parkas in the corpus. The model matched "jacket" and "winter" more
+strongly than "waterproof". Category precision was still 5/5 because a denim jacket is apparel —
+which is exactly the limitation of using category as a stand-in for a real relevance label.
+
+### The probe script is Phase 4's ground truth
+
+`scripts/probe_embeddings.py` does **exact** brute-force search: one dot product against all
+44,200 rows. HNSW in Phase 4 is **approximate**, so its recall — what fraction of the true top-K
+it actually found — can only be measured against an exact answer.
+`--dump-ground-truth` writes those exact results for Phase 4 to score itself against, which turns
+the accuracy-vs-speed tradeoff into a measurement rather than a claim.
+
+
 ## Running it
 
 ```bash
 uv sync --extra dev
 
-# 1. generate a synthetic corpus with deliberately seeded defects
+# everything, end to end: generate -> validate -> embed -> publish -> probe
+make pipeline
+
+# or one stage at a time
 uv run python scripts/generate_raw_ads.py --count 50000 --seed 42
+uv run python -m ingestion.validate --fail-under 0.85   # gate: non-zero exit blocks Phase 2
+uv run python scripts/check_oracle.py                   # counts match the seeded defects?
+uv run python -m ingestion.embed                        # gate: fails on token-limit overflow
+uv run python -m ingestion.publish                      # gate: fails on stale or broken vectors
+uv run python scripts/probe_embeddings.py               # brute-force sanity search
 
-# 2. validate it (--fail-under is the pipeline gate: non-zero exit blocks Phase 2)
-uv run python -m ingestion.validate --fail-under 0.85
-
-# 3. confirm the validator's counts match the generator's seeded defects
-uv run python scripts/check_oracle.py
-
-# 4. unit + end-to-end tests
-uv run pytest
+make test        # fast suite, no model download
+make test-slow   # the 6 tests that load the real model
 ```
 
-Outputs land in `data/clean/`: `ads_clean.jsonl`, `ads_rejected.jsonl`, `validation_report.json`.
+Each stage returns a non-zero exit code when its gate fails, so `make` stops. That's the point of
+gates rather than warnings.
+
+Phase 1 outputs land in `data/clean/`: `ads_clean.jsonl`, `ads_rejected.jsonl`,
+`validation_report.json`. Phase 2 outputs land in `data/embedded/` and `data/published/`.
 
 ### Why JSONL everywhere
 
@@ -113,7 +216,7 @@ it code for code; `scripts/check_oracle.py` proves it does. Without seeded defec
 has nothing to catch and the report is a wall of zeros — you can't trust a data-quality check
 you've never seen fire.
 
-## Results (50,000 ads, seed 42)
+## Results — Phase 1 (50,000 ads, seed 42)
 
 ```
 read         50,000
@@ -132,12 +235,23 @@ ingestion/
   clean.py      pure normalisation helpers (no I/O, no rejections)
   rules.py      one small function per rule -> None | Violation
   report.py     count aggregation, JSON artifact + terminal summary
-  validate.py   CLI: streams raw -> clean/reject -> report
+  validate.py   Phase 1 CLI: streams raw -> clean/reject -> report
+  fileutil.py   checksums + atomic JSON writes, shared by every stage
+  embedder.py   Embedder protocol + the pinned MiniLM implementation
+  embed.py      Phase 2 CLI: token gate -> batched embeddings.npy
+  publish.py    Phase 2 CLI: verify -> versioned bundle -> atomic LATEST
 scripts/
   generate_raw_ads.py   synthetic corpus with seeded defects + oracle
   check_oracle.py       diffs the report against the oracle
-tests/                  98 tests: cleaning, each rule, end-to-end + the gate
+  probe_embeddings.py   brute-force search; also Phase 4's ground truth
+tests/                  134 tests (128 fast + 6 that load the real model)
 ```
+
+`embed.py` depends on the small `Embedder` protocol rather than on
+`sentence-transformers` directly, so the fast suite plugs in a deterministic fake and never
+downloads 90 MB or imports torch. Everything that can genuinely go wrong in Phase 2 — the token
+gate, row alignment, checksums, atomic publishing — is pipeline logic that needs no real neural
+network to test.
 
 `rules.py` holds one function per rule rather than one fused `validate()` so that any single
 rule can be read, tested and explained in isolation. In production this layer is usually a
@@ -145,5 +259,5 @@ Pydantic model; it's hand-rolled here so the logic is visible rather than declar
 
 ## Stack
 
-Python 3.11 (pinned via `uv` — the Phase 2 ML stack lags newer releases), stdlib only for
-Phase 1, `pytest` for tests.
+Python 3.11 (pinned via `uv` — the ML stack lags newer releases). Phase 1 is stdlib-only;
+Phase 2 adds `sentence-transformers` 6.0.1, `torch` 2.14 and `numpy` 2.4. `pytest` for tests.

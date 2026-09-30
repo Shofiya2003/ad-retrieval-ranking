@@ -1,6 +1,10 @@
-# Generated + processed data (regenerate with scripts/generate_raw_ads.py)
+# Generated + processed data. All of it is reproducible from
+# `make pipeline` with a fixed seed, so none of it belongs in git --
+# data/published alone is ~83MB.
 data/raw/*
 data/clean/*
+data/embedded/
+data/published/
 !data/raw/.gitkeep
 !data/clean/.gitkeep
 

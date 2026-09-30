@@ -3,13 +3,20 @@ name = "ad-retrieval-ranking"
 version = "0.1.0"
 description = "Ad retrieval, ranking and ingestion pipeline (Python ingestion + Go serving)"
 requires-python = ">=3.11,<3.12"
-dependencies = []
+dependencies = [
+    "numpy>=2.4",
+    "sentence-transformers==6.0.1",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Tests that load the real 90MB model are deselected by default so the
+# everyday suite stays fast and offline. Run them with: pytest -m slow
+markers = ["slow: loads the real embedding model"]
+addopts = "-m 'not slow'"
 
 [build-system]
 requires = ["hatchling"]

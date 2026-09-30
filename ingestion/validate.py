@@ -16,30 +16,19 @@ duplicate without remembering what you have seen.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 import time
 from pathlib import Path
 
 from ingestion import clean, rules, schema
+from ingestion.fileutil import sha256_of_file
 from ingestion.report import ValidationReport
 from ingestion.schema import AdRecord
 
 EXIT_OK = 0
 EXIT_GATE_FAILED = 1
 EXIT_INPUT_ERROR = 2
-
-
-def sha256_of_file(path: Path) -> str:
-    """Fingerprint the input so a report can always be traced to exactly the
-    bytes that produced it. Costs one extra read of the file, which is cheap
-    next to the value of a reproducible artifact."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def validate_record(raw: dict, deduper: rules.Deduplicator):
