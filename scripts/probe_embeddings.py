@@ -12,6 +12,10 @@
    for Phase 4 to score itself against, which is what turns the
    accuracy-vs-speed tradeoff into a measurement instead of a claim.
 
+   The dump also carries each query's vector and the bundle it was taken
+   from, so the Go loader's exact search can be checked against this one
+   before Go is able to embed text itself.
+
     python scripts/probe_embeddings.py
 """
 
@@ -129,12 +133,21 @@ def main() -> int:
     if args.dump_ground_truth:
         payload = {
             "bundle": str(bundle),
+            # The stamp. Go refuses to compare against ground truth taken from
+            # a different bundle: old answers against new vectors would report
+            # nonsense either way.
+            "bundle_version": bundle.name,
+            "vectors_sha256": manifest["vectors"]["sha256"],
             "model": model_spec,
             "k": args.k,
             "queries": [
                 {
                     "query": query,
                     "expected_category": expected,
+                    # Go cannot embed text yet, so it searches with the exact
+                    # query vector Python used. This file is test data; the
+                    # published bundle itself is untouched.
+                    "vector": [float(x) for x in query_vectors[row]],
                     "top_k": [
                         {"ad_id": ads[int(i)]["ad_id"], "row": int(i), "score": float(s)}
                         for i, s in zip(indices[row], scores[row])

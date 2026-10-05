@@ -5,6 +5,7 @@ data/raw/*
 data/clean/*
 data/embedded/
 data/published/
+data/eval/
 !data/raw/.gitkeep
 !data/clean/.gitkeep
 
