@@ -18,16 +18,38 @@ becomes approximate.
 
 ## Architecture
 
-```
-            INGESTION  (Python, offline)                    SERVING  (Go, online)
+```mermaid
+flowchart LR
+    subgraph OFFLINE["Ingestion · Python · offline"]
+        direction LR
+        GEN["Synthetic generator<br/>50k ads + seeded defects"] --> VAL["Validate + clean<br/>12 reject codes"]
+        VAL --> EMB["Embed<br/>MiniLM-L6-v2 · 384-d<br/>token gate"]
+        EMB --> PUB["Publish<br/>checksums · atomic rename"]
+        VAL -. rejects .-> REJ[("ads_rejected.jsonl<br/>+ report")]
+    end
 
-  raw ads ──▶ validate ──▶ embed ──▶ publish ──▶ bundle ──▶ loader ──▶ vector index ──▶ rank ──▶ /rank
-              + clean     (MiniLM)  (atomic,    on disk     (verify,    (exact now,      ▲
-                                    versioned)              in-memory)  HNSW next)       │
-                                                                  ▲                      │
-                                                    query /embed sidecar        Redis feature
-                                                    (same pinned model)         store + cache
+    PUB --> BUNDLE[("Versioned bundle<br/>vectors.f32 · ads.jsonl<br/>manifest.json · LATEST")]
+
+    subgraph ONLINE["Serving · Go · online"]
+        direction LR
+        LOAD["Loader<br/>verify → flat []float32<br/>immutable *Bundle"] --> EXACT["Exact top-k<br/>min-heap"]
+        LOAD --> HNSW["HNSW index<br/>approximate top-k"]
+        HNSW --> RANK["Ranker<br/>relevance × bid"]
+        RANK --> API["/rank API"]
+    end
+
+    BUNDLE --> LOAD
+    Q(["User query"]) --> SIDE["/embed sidecar<br/>same pinned model"]
+    SIDE --> HNSW
+    BUNDLE -. model identity .-> SIDE
+    REDIS[("Redis<br/>features + cache")] <--> RANK
+    EXACT -. ground truth for recall .-> HNSW
+
+    classDef planned stroke-dasharray: 5 5,fill:#f6f8fa,color:#57606a
+    class HNSW,RANK,API,SIDE,REDIS,Q planned
 ```
+
+Solid boxes are built. Dashed boxes are in progress.
 
 **Built:** data generation, validation + cleaning, embedding, atomic publishing, and the Go loader
 with exact top-k search.
