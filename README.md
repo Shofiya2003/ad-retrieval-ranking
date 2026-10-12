@@ -16,40 +16,52 @@ explicit, tested and measured: what counts as bad data, how vectors are produced
 how the serving process knows its data is intact, and what accuracy is lost when exact search
 becomes approximate.
 
-## Architecture
+## How an ad request is served
 
 ```mermaid
-flowchart LR
-    subgraph OFFLINE["Ingestion · Python · offline"]
-        direction LR
-        GEN["Synthetic generator<br/>50k ads + seeded defects"] --> VAL["Validate + clean<br/>12 reject codes"]
-        VAL --> EMB["Embed<br/>MiniLM-L6-v2 · 384-d<br/>token gate"]
-        EMB --> PUB["Publish<br/>checksums · atomic rename"]
-        VAL -. rejects .-> REJ[("ads_rejected.jsonl<br/>+ report")]
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant API as Go server<br/>POST /rank
+    participant R as Redis
+    participant S as /embed sidecar<br/>(Python, MiniLM)
+    participant IX as HNSW index<br/>(in memory)
+    participant RK as Ranker
+
+    C->>API: query "how do I lower my tax bill", k = 10
+    API->>R: cached result for this query?
+    alt cache hit
+        R-->>API: ranked ads
+    else cache miss
+        API->>S: embed query text
+        S-->>API: 384-d unit vector
+        API->>IX: nearest neighbours (dot product)
+        IX-->>API: top candidates + similarity scores
+        API->>R: fetch features for candidates
+        R-->>API: bid, category, advertiser features
+        API->>RK: candidates + features
+        RK-->>API: ads ordered by relevance and bid
+        API->>R: cache the ranked result
     end
+    API-->>C: top-k ads (id, headline, score)
 
-    PUB --> BUNDLE[("Versioned bundle<br/>vectors.f32 · ads.jsonl<br/>manifest.json · LATEST")]
-
-    subgraph ONLINE["Serving · Go · online"]
-        direction LR
-        LOAD["Loader<br/>verify → flat []float32<br/>immutable *Bundle"] --> EXACT["Exact top-k<br/>min-heap"]
-        LOAD --> HNSW["HNSW index<br/>approximate top-k"]
-        HNSW --> RANK["Ranker<br/>relevance × bid"]
-        RANK --> API["/rank API"]
-    end
-
-    BUNDLE --> LOAD
-    Q(["User query"]) --> SIDE["/embed sidecar<br/>same pinned model"]
-    SIDE --> HNSW
-    BUNDLE -. model identity .-> SIDE
-    REDIS[("Redis<br/>features + cache")] <--> RANK
-    EXACT -. ground truth for recall .-> HNSW
-
-    classDef planned stroke-dasharray: 5 5,fill:#f6f8fa,color:#57606a
-    class HNSW,RANK,API,SIDE,REDIS,Q planned
+    Note over API,IX: Ads are never embedded per request. Their vectors were computed offline<br/>and loaded at startup from a verified bundle. A new bundle is swapped in atomically.
 ```
 
-Solid boxes are built. Dashed boxes are in progress.
+1. **The query is embedded once.** The sidecar runs the same pinned model that embedded the
+   ads offline, and the Go server checks that the model identity matches the bundle's manifest
+   before serving.
+2. **Retrieval answers "what is this ad about?"** The HNSW index searches all 44,200 ad vectors
+   in memory and returns the closest candidates by dot product.
+3. **Ranking answers "which relevant ad should win?"** Candidates are scored on relevance plus
+   explicit signals such as bid and category from the feature store, which is why bid and
+   category are kept out of the vectors.
+4. **Redis sits on both sides of the work.** It caches the final result for repeated queries
+   and stores the per-ad features the ranker needs.
+
+Everything on the request path reads from memory or Redis. The only expensive step, embedding
+the ad corpus, happens offline in the Python pipeline, which publishes a versioned bundle the Go
+server loads at startup.
 
 **Built:** data generation, validation + cleaning, embedding, atomic publishing, and the Go loader
 with exact top-k search.
