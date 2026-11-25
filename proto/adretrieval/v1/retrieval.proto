@@ -1,0 +1,63 @@
+// The contract between the Go serving layer and the Python retrieval service.
+//
+// Go sends text and gets back ad ids; vectors never cross this boundary.
+// Fields are only ever added, never renumbered or retyped. A breaking change
+// goes into a new package (adretrieval.v2), served alongside v1 while clients
+// migrate.
+syntax = "proto3";
+
+package adretrieval.v1;
+
+option go_package = "github.com/Shofiya2003/ad-retrieval-ranking/serving/gen/adretrieval/v1;retrievalv1";
+
+service RetrievalService {
+  // Embed the query with the bundle's model and return the nearest ads.
+  // Errors are gRPC status codes: INVALID_ARGUMENT for a bad request,
+  // DEADLINE_EXCEEDED when the caller's deadline passes.
+  rpc Retrieve(RetrieveRequest) returns (RetrieveResponse);
+
+  // What this server is serving. Clients compare it with their own bundle
+  // manifest before sending traffic, and refuse on any mismatch.
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+}
+
+message RetrieveRequest {
+  string query = 1;
+  // 1..1000.
+  uint32 k = 2;
+  // Brute-force search instead of HNSW: for evaluation, and for
+  // shadow-checking recall on a sample of live traffic.
+  bool exact = 3;
+}
+
+message Hit {
+  string ad_id = 1;
+  uint32 row = 2;
+  // Dot product of unit vectors, i.e. cosine similarity.
+  float score = 3;
+}
+
+message RetrieveResponse {
+  // Best first.
+  repeated Hit hits = 1;
+  // Clients must reject a response whose version differs from their own
+  // bundle: the ad ids would refer to different data.
+  string bundle_version = 2;
+  uint32 embed_us = 3;
+  uint32 search_us = 4;
+}
+
+message GetInfoRequest {}
+
+message GetInfoResponse {
+  string bundle_version = 1;
+  string model_name = 2;
+  string model_revision = 3;
+  uint32 dim = 4;
+  uint32 ad_count = 5;
+  // "hnsw" or "exact".
+  string index_kind = 6;
+  uint32 hnsw_m = 7;
+  uint32 hnsw_ef_construction = 8;
+  uint32 hnsw_ef_search_default = 9;
+}

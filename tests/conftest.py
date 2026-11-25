@@ -73,3 +73,14 @@ def clean_file(tmp_path):
         "\n".join(json.dumps(make_ad(i)) for i in range(12)) + "\n", encoding="utf-8"
     )
     return path
+
+
+@pytest.fixture
+def published_root(clean_file, tmp_path, fake_embedder):
+    """A real bundle, produced by the actual embed + publish stages with the
+    fake embedder. Returns the root that holds LATEST."""
+    from ingestion import embed, publish
+
+    embed.run(clean_file, tmp_path / "embedded", fake_embedder)
+    publish.run(clean_file, tmp_path / "embedded", tmp_path / "published")
+    return tmp_path / "published"
